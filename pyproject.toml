@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuroweave-timeline"
+version = "0.1.0"
+description = "Process memory for AI agents and humans. Records how a project became what it is."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "NeuroWeave" }]
+keywords = ["timeline", "memory", "agent", "mcp", "process-history"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Software Development :: Version Control",
+]
+
+dependencies = [
+    "click>=8.1",
+    "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[project.scripts]
+nwt = "nwt.cli.main:cli"
+nwt-mcp = "nwt.mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/neuroweave/neuroweave-timeline"
+Issues = "https://github.com/neuroweave/neuroweave-timeline/issues"
+
+[tool.setuptools.packages.find]
+include = ["nwt*"]
+exclude = ["tests*", "examples*", "docs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
