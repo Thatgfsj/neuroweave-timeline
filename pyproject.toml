@@ -39,8 +39,10 @@ nwt = "nwt.cli.main:cli"
 nwt-mcp = "nwt.mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/neuroweave/neuroweave-timeline"
-Issues = "https://github.com/neuroweave/neuroweave-timeline/issues"
+Homepage = "https://github.com/Thatgfsj/neuroweave-timeline"
+Repository = "https://github.com/Thatgfsj/neuroweave-timeline"
+Issues = "https://github.com/Thatgfsj/neuroweave-timeline/issues"
+Changelog = "https://github.com/Thatgfsj/neuroweave-timeline/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["nwt*"]

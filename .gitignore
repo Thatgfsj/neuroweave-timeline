@@ -35,3 +35,24 @@ Thumbs.db
 
 # NWT runtime data — never commit a project's own timeline
 .nwt/
+
+# Secrets — never commit credentials, tokens, or keys of any kind
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+credentials.*
+*id_rsa*
+*id_ed25519*
+# GitHub / GitLab / generic API tokens (defence in depth — never the source of truth)
+*ghp_*
+*gho_*
+*ghu_*
+*ghs_*
+*ghr_*
+*github_pat_*
+*glpat-*
