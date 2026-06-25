@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "neuroweave-timeline"
+name = "NWtimeline"
 version = "0.1.0"
 description = "Process memory for AI agents and humans. Records how a project became what it is."
 readme = "README.md"

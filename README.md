@@ -6,8 +6,9 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/Thatgfsj/neuroweave-timeline/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/Thatgfsj/neuroweave-timeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![PyPI: NWtimeline](https://img.shields.io/pypi/v/NWtimeline?style=flat-square&logo=pypi&logoColor=white)](https://pypi.org/project/NWtimeline/)
 [![MCP](https://img.shields.io/badge/MCP-std.io-orange.svg?style=flat-square)](https://modelcontextprotocol.io)
-[![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue.svg?style=flat-square)](https://github.com/Thatgfsj/neuroweave-timeline/releases/tag/v0.1.0)
+[![Release v0.2.0](https://img.shields.io/badge/release-v0.2.0-blue.svg?style=flat-square)](https://github.com/Thatgfsj/neuroweave-timeline/releases/tag/v0.2.0)
 [![GitHub stars](https://img.shields.io/github/stars/Thatgfsj/neuroweave-timeline?style=flat-square)](https://github.com/Thatgfsj/neuroweave-timeline/stargazers)
 
 Most tools remember **results**. NWT remembers **evolution**.
@@ -33,8 +34,26 @@ project looks the way it does today.
 | *What happened three months ago?* | `nwt history` |
 | *What decisions led to the current design?* | `nwt story` |
 | *Show me the evolution graph* | `nwt graph` |
+| *What did that commit actually do?* | `nwt git-hook-status` |
 
 AI agents reach the same answers over MCP — see [MCP integration](#-mcp-integration).
+
+## 🌱 Auto-grow: timeline from `git commit`
+
+The single biggest reason NWT timelines are empty is friction. The
+v0.2 fix is a post-commit hook that logs an event on every commit
+— no human or agent typing required.
+
+```bash
+nwt init
+nwt install-git-hook
+git commit -m "Refactor retrieval layer" -m "Reason: lookup latency was high"
+nwt: logged [12] Refactor retrieval layer
+```
+
+Add `--strict` to refuse events without a `Reason:` line, and
+`--ai-command "claude -p"` to let an external model fill the reason
+when the human didn't. See [`docs/git-hook.md`](docs/git-hook.md).
 
 ---
 
@@ -188,7 +207,7 @@ cwd. See [`docs/mcp.md`](docs/mcp.md) for the recommended agent loop:
 
 ---
 
-## 📦 Install
+## 📦 安装
 
 ```bash
 # from a clone (editable)
@@ -197,13 +216,12 @@ cd neuroweave-timeline
 pip install -e .
 
 # from PyPI (coming soon)
-pip install neuroweave-timeline
+pip install NWtimeline
 ```
 
-Requires **Python 3.10+**. The CLI depends on `click`; the MCP server
-depends on `mcp`. Both install automatically.
+需要 Python 3.10+。CLI 依赖于 `click`；MCP 服务器依赖于 `mcp`。两者都是自动安装的。
 
-To install dev dependencies (pytest) and run the test suite:
+安装开发依赖（pytest）并运行测试套件：
 
 ```bash
 pip install -e ".[dev]"
@@ -214,13 +232,15 @@ pytest -q
 
 ## 🗺️ Roadmap
 
-v0.1 (this release) is the MVP. Phases 1–6 of the spec are done.
-Highlights of what's next:
+v0.2 (this release) is the "auto-grow" cut: git hook integration,
+strict mode, file biography, and event templates. The timeline
+fills itself now.
 
-- **v0.2** — git integration; auto-link events to commits
-- **v0.3** — workspace snapshots; restore a project at a past event
-- **v0.4** — multi-agent collaboration history
-- **v0.5** — NWC integration, *only if NWT earns it on its own*
+- **v0.3** — agent integration. Drive NWT through Claude Code,
+  Cursor, and OpenAI Agents to find the gaps.
+- **v0.4** — multi-agent collaboration history (concurrency-safe
+  writes, per-author identity).
+- **v0.5** — NWC integration, *only if NWT earns it on its own*.
 
 See [`docs/roadmap.md`](docs/roadmap.md) and
 [`docs/standalone.md`](docs/standalone.md) for the full story.
