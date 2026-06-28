@@ -40,6 +40,7 @@ def create_event(
     files: Iterable[str] | None = None,
     tags: Iterable[str] | None = None,
     parent: str | None = None,
+    importance: str = "normal",
     timestamp: str | None = None,
     meta: dict | None = None,
     root: str | Path | None = None,
@@ -63,6 +64,7 @@ def create_event(
         files=files,
         tags=tags,
         parent=parent,
+        importance=importance,
         timestamp=timestamp,
         meta=meta,
     )
@@ -190,6 +192,127 @@ def iter_relations(root: str | Path | None = None) -> dict[str, list[tuple[str, 
     return read_all_relations(ws)
 
 
+def diff_events(
+    from_id: str,
+    to_id: str,
+    *,
+    root: str | Path | None = None,
+) -> dict:
+    """Compare two events and return the changes between them.
+
+    Returns a dict with:
+      - events: list of events between from and to
+      - files_added: files present in to but not in from
+      - files_removed: files present in from but not in to
+      - files_modified: files present in both
+    """
+    ws = _resolve_workspace(root)
+    from_event = read_event(ws, _canonical_id(ws, from_id))
+    to_event = read_event(ws, _canonical_id(ws, to_id))
+
+    all_events = read_all_events(ws)
+    all_events.sort(key=lambda e: e.id)
+
+    from_idx = next((i for i, e in enumerate(all_events) if e.id == from_event.id), 0)
+    to_idx = next((i for i, e in enumerate(all_events) if e.id == to_event.id), len(all_events) - 1)
+
+    between = all_events[from_idx:to_idx + 1]
+
+    from_files = set(from_event.files)
+    to_files = set(to_event.files)
+    all_files = set(f for e in between for f in e.files)
+
+    return {
+        "events": between,
+        "files_added": sorted(to_files - from_files),
+        "files_removed": sorted(from_files - to_files),
+        "files_modified": sorted(from_files & to_files),
+    }
+
+
+def compact_events(
+    *,
+    root: str | Path | None = None,
+    time_window_seconds: int = 3600,
+    min_group_size: int = 3,
+) -> dict:
+    """Merge consecutive events with the same tags that are close in time.
+
+    Groups events where:
+    - Same tags
+    - Within time_window_seconds (default 1 hour)
+
+    If a group has min_group_size or more events, they are merged into one.
+    Returns a dict with original_count, compacted_count, merged.
+    """
+    ws = _resolve_workspace(root)
+    events = read_all_events(ws)
+    events.sort(key=lambda e: e.id)
+
+    if len(events) < min_group_size:
+        return {"original_count": len(events), "compacted_count": len(events), "merged": 0}
+
+    # Group consecutive events with same tags
+    groups: list[list[TimelineEvent]] = [[events[0]]]
+
+    for i in range(1, len(events)):
+        prev = events[i - 1]
+        curr = events[i]
+
+        same_tags = sorted(curr.tags) == sorted(prev.tags)
+        try:
+            prev_time = _parse_iso(prev.timestamp)
+            curr_time = _parse_iso(curr.timestamp)
+            time_diff = (curr_time - prev_time).total_seconds()
+        except (ValueError, TypeError):
+            time_diff = float('inf')
+
+        if same_tags and time_diff < time_window_seconds:
+            groups[-1].append(curr)
+        else:
+            groups.append([curr])
+
+    # Merge groups
+    merged = 0
+    new_events: list[TimelineEvent] = []
+
+    for group in groups:
+        if len(group) >= min_group_size:
+            first = group[0]
+            last = group[-1]
+            all_files = list(dict.fromkeys(f for e in group for f in e.files))
+
+            new_events.append(TimelineEvent.create(
+                task=f"{first.task} ... {last.task}",
+                summary=f"Compacted {len(group)} events: {', '.join(e.task for e in group)}",
+                files=all_files,
+                tags=first.tags,
+                importance=first.importance,
+                parent=first.parent,
+                timestamp=first.timestamp,
+            ))
+            merged += len(group) - 1
+        else:
+            new_events.extend(group)
+
+    if merged == 0:
+        return {"original_count": len(events), "compacted_count": len(events), "merged": 0}
+
+    # Re-write events
+    from nwt.storage.writer import write_event
+    # Clear existing events by removing files
+    events_dir = ws.nwt_dir / "events"
+    for f in events_dir.glob("*.json"):
+        f.unlink()
+
+    # Write new events with re-numbered IDs
+    for i, ev in enumerate(new_events):
+        ev.id = str(i + 1).zfill(6)
+        write_event(ws, ev)
+
+    return {"original_count": len(events), "compacted_count": len(new_events), "merged": merged}
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -221,3 +344,11 @@ def _matches(ev: TimelineEvent, q: str) -> bool:
         " ".join(ev.tags).lower(),
     ]
     return any(q in h for h in haystacks)
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse an ISO 8601 timestamp, accepting a trailing ``Z``."""
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)

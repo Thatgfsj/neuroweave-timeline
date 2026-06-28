@@ -51,6 +51,7 @@ class TimelineEvent:
     files: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     parent: str | None = None
+    importance: str = "normal"  # "low" | "normal" | "high" | "milestone"
     meta: dict[str, Any] = field(default_factory=dict)
 
     # ----- construction helpers ------------------------------------------------
@@ -65,6 +66,7 @@ class TimelineEvent:
         files: Iterable[str] | None = None,
         tags: Iterable[str] | None = None,
         parent: str | None = None,
+        importance: str = "normal",
         event_id: str | None = None,
         timestamp: str | None = None,
         meta: dict[str, Any] | None = None,
@@ -84,6 +86,7 @@ class TimelineEvent:
             files=list(files or []),
             tags=_normalize_tags(tags or []),
             parent=parent,
+            importance=importance if importance in ("low", "normal", "high", "milestone") else "normal",
             meta=dict(meta or {}),
         )
 
@@ -105,6 +108,8 @@ class TimelineEvent:
             d["tags"] = list(self.tags)
         if self.parent is not None:
             d["parent"] = self.parent
+        if self.importance and self.importance != "normal":
+            d["importance"] = self.importance
         if self.meta:
             d["meta"] = dict(self.meta)
         return d
@@ -124,7 +129,7 @@ class TimelineEvent:
             raise ValidationError(f"event must be a JSON object, got {type(data).__name__}")
 
         unknown = set(data) - set(_REQUIRED_FIELDS) - {
-            "reason", "files", "tags", "parent", "meta",
+            "reason", "files", "tags", "parent", "importance", "meta",
         }
         if unknown:
             raise ValidationError(
@@ -168,6 +173,10 @@ class TimelineEvent:
             except ValueError as e:
                 raise ValidationError(f"invalid parent id {parent!r}: {e}") from e
 
+        importance = data.get("importance", "normal")
+        if importance not in ("low", "normal", "high", "milestone"):
+            importance = "normal"
+
         meta = data.get("meta", {})
         if not isinstance(meta, dict):
             raise ValidationError("'meta' must be an object when present")
@@ -181,6 +190,7 @@ class TimelineEvent:
             files=list(files),
             tags=_normalize_tags(tags),
             parent=parent,
+            importance=importance,
             meta=dict(meta),
         )
 

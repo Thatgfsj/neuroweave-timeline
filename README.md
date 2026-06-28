@@ -35,6 +35,8 @@ project looks the way it does today.
 | *What decisions led to the current design?* | `nwt story` |
 | *Show me the evolution graph* | `nwt graph` |
 | *What did that commit actually do?* | `nwt git-hook-status` |
+| *What changed between two events?* | `nwt diff 1 5` |
+| *Merge small consecutive events* | `nwt compact` |
 
 AI agents reach the same answers over MCP — see [MCP integration](#-mcp-integration).
 
@@ -143,6 +145,45 @@ modified in: 4, 5
 reason:
   Retrieval was sequential and slow
 ```
+
+---
+
+## 🆕 New features (v0.3)
+
+### Event importance
+
+Events now have an `importance` field: `low`, `normal` (default), `high`, `milestone`.
+
+```bash
+nwt log "Fix login bug" --summary "..." --importance high
+nwt log "Project launched" --summary "..." --importance milestone
+```
+
+The `story` command groups events by importance.
+
+### `nwt diff` — compare two events
+
+```bash
+nwt diff 1 5
+# Output:
+# Diff: [1] → [5]
+# Events: 5 between these points
+# Added: new_feature.py
+# Modified: main.py
+```
+
+### `nwt compact` — merge small events
+
+When you have many small consecutive events with the same tags, compact them:
+
+```bash
+nwt compact
+# Compacted: 50 → 35 events (merged 15)
+```
+
+Options:
+- `--time-window 3600` — group events within 1 hour (default)
+- `--min-group 3` — minimum group size to merge (default)
 
 ---
 

@@ -85,6 +85,9 @@ def init(ctx: click.Context, name: str | None) -> None:
 @click.option("--reason", default=None, help="Why this change was made.")
 @click.option("--files", default=None, help="Comma-separated list of files touched.")
 @click.option("--tags", default=None, help="Comma-separated list of tags.")
+@click.option("--importance", default="normal",
+              type=click.Choice(["low", "normal", "high", "milestone"], case_sensitive=False),
+              help="Event importance level.")
 @click.option("--parent", default=None, help="Parent event id (linear chain).")
 @click.option("--timestamp", default=None, help="Override timestamp (ISO 8601).")
 @click.pass_context
@@ -95,6 +98,7 @@ def log_cmd(
     reason: str | None,
     files: str | None,
     tags: str | None,
+    importance: str,
     parent: str | None,
     timestamp: str | None,
 ) -> None:
@@ -109,6 +113,7 @@ def log_cmd(
             files=_split_csv(files),
             tags=_split_csv(tags),
             parent=parent,
+            importance=importance,
             timestamp=timestamp,
             root=ctx.obj["root"],
         )
@@ -134,10 +139,11 @@ def history(ctx: click.Context, limit: int | None, offset: int, reverse: bool) -
         sys.exit(1)
     for ev in events:
         tag_str = f"  [{', '.join(ev.tags)}]" if ev.tags else ""
+        imp_str = f"  ({ev.importance})" if hasattr(ev, 'importance') and ev.importance and ev.importance != "normal" else ""
         reason = f"\n      reason: {ev.reason}" if ev.reason else ""
         files = f"\n      files:  {', '.join(ev.files)}" if ev.files else ""
         click.echo(
-            f"  [{ev.short_id()}] {_short_date(ev.timestamp)}  {ev.task}{tag_str}{reason}{files}"
+            f"  [{ev.short_id()}] {_short_date(ev.timestamp)}  {ev.task}{imp_str}{tag_str}{reason}{files}"
         )
     if not events:
         click.echo("(no events)")
@@ -314,6 +320,64 @@ def rebuild_indices_cmd(ctx: click.Context) -> None:
         _err(str(e))
         sys.exit(1)
     click.secho("indices rebuilt", fg="green")
+
+
+@cli.command()
+@click.argument("from_id")
+@click.argument("to_id")
+@click.pass_context
+def diff(ctx: click.Context, from_id: str, to_id: str) -> None:
+    """Show changes between two events."""
+    try:
+        result = timeline.diff_events(from_id, to_id, root=ctx.obj["root"])
+    except NWTError as e:
+        _err(str(e))
+        sys.exit(1)
+
+    events = result["events"]
+    click.echo(f"Diff: [{events[0].short_id()}] → [{events[-1].short_id()}]")
+    click.echo(f"Events: {len(events)} between these points")
+    click.echo()
+
+    if result["files_added"]:
+        click.secho(f"Added: {', '.join(result['files_added'])}", fg="green")
+    if result["files_removed"]:
+        click.secho(f"Removed: {', '.join(result['files_removed'])}", fg="red")
+    if result["files_modified"]:
+        click.echo(f"Modified: {', '.join(result['files_modified'])}")
+
+    click.echo()
+    click.echo("Events in range:")
+    for ev in events:
+        click.echo(f"  [{ev.short_id()}] {_short_date(ev.timestamp)} {ev.task}")
+
+
+@cli.command()
+@click.option("--time-window", type=int, default=3600, show_default=True,
+              help="Time window in seconds for grouping events.")
+@click.option("--min-group", type=int, default=3, show_default=True,
+              help="Minimum group size to compact.")
+@click.pass_context
+def compact(ctx: click.Context, time_window: int, min_group: int) -> None:
+    """Merge consecutive events with same tags that are close in time."""
+    try:
+        result = timeline.compact_events(
+            root=ctx.obj["root"],
+            time_window_seconds=time_window,
+            min_group_size=min_group,
+        )
+    except NWTError as e:
+        _err(str(e))
+        sys.exit(1)
+
+    if result["merged"] == 0:
+        click.echo("No events to compact.")
+    else:
+        click.secho(
+            f"Compacted: {result['original_count']} → {result['compacted_count']} events "
+            f"(merged {result['merged']})",
+            fg="green",
+        )
 
 
 # --- helpers -----------------------------------------------------------------
