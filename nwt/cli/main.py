@@ -1,10 +1,11 @@
 """Click-based CLI for NWT.
 
-Command surface (matches the spec)::
+Command surface::
 
     nwt init
     nwt log TASK [--summary TEXT] [--reason TEXT] [--files f1,f2]
-                 [--tags t1,t2] [--parent ID] [--timestamp ISO]
+                 [--tags t1,t2] [--parent ID|none] [--timestamp ISO]
+                 [--importance LEVEL]
     nwt history [--limit N] [--offset N] [--reverse]
     nwt show ID
     nwt search QUERY
@@ -14,7 +15,12 @@ Command surface (matches the spec)::
     nwt link SOURCE TARGET --relation RELATION
     nwt story [--max-milestones N]
     nwt explain PATH
+    nwt diff FROM TO
+    nwt compact [--time-window S] [--min-group N] [--dry-run]
     nwt rebuild-indices
+    nwt install-git-hook [--strict] [--ai-command CMD]
+    nwt git-hook-status
+    nwt log-commit [--strict] [--ai-command CMD]
 
 All commands share a single global ``--root`` flag pointing at the
 project root (the directory containing ``.nwt/``). The default is the
@@ -31,10 +37,12 @@ import click
 
 from nwt import __version__
 from nwt.core.errors import NWTError
+from nwt.core.time import short_date
 from nwt.graph.builder import build_graph
-from nwt.graph.lineage import explain_file
+from nwt.graph.lineage import explain_file as explain_file_lineage
+from nwt.graph.lineage import to_json_dict
 from nwt.graph.visualize import render_tree
-from nwt.storage.layout import init_workspace
+from nwt.storage.layout import init_workspace, open_workspace
 from nwt.storage.writer import rebuild_indices
 from nwt.timeline import engine as timeline
 from nwt.timeline.summary import build_story
@@ -42,6 +50,11 @@ from nwt.timeline.summary import build_story
 
 def _err(msg: str) -> None:
     click.secho(f"error: {msg}", fg="red", err=True)
+
+
+def _ws(ctx: click.Context):
+    """Open the workspace for the invoked command (raises NWTError)."""
+    return open_workspace(ctx.obj["root"])
 
 
 # --- root group --------------------------------------------------------------
@@ -63,7 +76,7 @@ def cli(ctx: click.Context, root: Path) -> None:
     ctx.obj["root"] = root
 
 
-# --- commands ----------------------------------------------------------------
+# --- workspace commands --------------------------------------------------------
 
 
 @cli.command()
@@ -79,6 +92,9 @@ def init(ctx: click.Context, name: str | None) -> None:
     click.secho(f"initialized NWT workspace at {ws.nwt_dir}", fg="green")
 
 
+# --- event commands -------------------------------------------------------------
+
+
 @cli.command("log")
 @click.argument("task")
 @click.option("--summary", default=None, help="One-sentence description of the change.")
@@ -88,7 +104,9 @@ def init(ctx: click.Context, name: str | None) -> None:
 @click.option("--importance", default="normal",
               type=click.Choice(["low", "normal", "high", "milestone"], case_sensitive=False),
               help="Event importance level.")
-@click.option("--parent", default=None, help="Parent event id (linear chain).")
+@click.option("--parent", default=None,
+              help="Parent event id, or 'none' to start a new branch "
+                   "[default: append after the latest event].")
 @click.option("--timestamp", default=None, help="Override timestamp (ISO 8601).")
 @click.pass_context
 def log_cmd(
@@ -124,8 +142,8 @@ def log_cmd(
 
 
 @cli.command()
-@click.option("--limit", type=int, default=None, help="Maximum number of events to show.")
-@click.option("--offset", type=int, default=0, help="Skip the first N events.")
+@click.option("--limit", type=click.IntRange(min=0), default=None, help="Maximum number of events to show.")
+@click.option("--offset", type=click.IntRange(min=0), default=0, help="Skip the first N events.")
 @click.option("--reverse/--forward", default=False, help="Show newest first.")
 @click.pass_context
 def history(ctx: click.Context, limit: int | None, offset: int, reverse: bool) -> None:
@@ -139,11 +157,11 @@ def history(ctx: click.Context, limit: int | None, offset: int, reverse: bool) -
         sys.exit(1)
     for ev in events:
         tag_str = f"  [{', '.join(ev.tags)}]" if ev.tags else ""
-        imp_str = f"  ({ev.importance})" if hasattr(ev, 'importance') and ev.importance and ev.importance != "normal" else ""
+        imp_str = f"  ({ev.importance})" if ev.importance != "normal" else ""
         reason = f"\n      reason: {ev.reason}" if ev.reason else ""
         files = f"\n      files:  {', '.join(ev.files)}" if ev.files else ""
         click.echo(
-            f"  [{ev.short_id()}] {_short_date(ev.timestamp)}  {ev.task}{imp_str}{tag_str}{reason}{files}"
+            f"  [{ev.short_id()}] {short_date(ev.timestamp)}  {ev.task}{imp_str}{tag_str}{reason}{files}"
         )
     if not events:
         click.echo("(no events)")
@@ -164,7 +182,7 @@ def show(ctx: click.Context, event_id: str) -> None:
 
 @cli.command()
 @click.argument("query")
-@click.option("--limit", type=int, default=None)
+@click.option("--limit", type=click.IntRange(min=0), default=None)
 @click.pass_context
 def search(ctx: click.Context, query: str, limit: int | None) -> None:
     """Search across task, summary, reason, files, and tags."""
@@ -212,16 +230,79 @@ def search_tag(ctx: click.Context, tag: str) -> None:
 
 
 @cli.command()
-@click.option("--max", "max_per_chain", type=int, default=200, show_default=True,
+@click.argument("from_id")
+@click.argument("to_id")
+@click.pass_context
+def diff(ctx: click.Context, from_id: str, to_id: str) -> None:
+    """Show changes between two events (FROM must precede TO)."""
+    try:
+        result = timeline.diff_events(from_id, to_id, root=ctx.obj["root"])
+    except NWTError as e:
+        _err(str(e))
+        sys.exit(1)
+
+    events = result["events"]
+    click.echo(f"Diff: [{events[0].short_id()}] → [{events[-1].short_id()}]")
+    click.echo(f"Events: {len(events)} between these points")
+    click.echo()
+
+    if result["files_added"]:
+        click.secho(f"Added: {', '.join(result['files_added'])}", fg="green")
+    if result["files_removed"]:
+        click.secho(f"Removed: {', '.join(result['files_removed'])}", fg="red")
+    if result["files_in_both"]:
+        click.echo(f"In both (likely modified): {', '.join(result['files_in_both'])}")
+
+    click.echo()
+    click.echo("Events in range:")
+    for ev in events:
+        click.echo(f"  [{ev.short_id()}] {short_date(ev.timestamp)} {ev.task}")
+
+
+@cli.command()
+@click.option("--time-window", type=click.IntRange(min=0), default=3600, show_default=True,
+              help="Time window in seconds for grouping events.")
+@click.option("--min-group", type=click.IntRange(min=2), default=3, show_default=True,
+              help="Minimum group size to compact.")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be merged without touching disk.")
+@click.pass_context
+def compact(ctx: click.Context, time_window: int, min_group: int, dry_run: bool) -> None:
+    """Merge consecutive events with same tags that are close in time."""
+    try:
+        result = timeline.compact_events(
+            root=ctx.obj["root"],
+            time_window_seconds=time_window,
+            min_group_size=min_group,
+            dry_run=dry_run,
+        )
+    except NWTError as e:
+        _err(str(e))
+        sys.exit(1)
+
+    if result["merged"] == 0:
+        click.echo("No events to compact.")
+        return
+    label = "Would compact" if result["dry_run"] else "Compacted"
+    click.echo(
+        f"{label}: {result['original_count']} → {result['compacted_count']} events "
+        f"(merged {result['merged']})"
+    )
+    if result["backup"]:
+        click.secho(f"backup: {result['backup']}", fg="cyan")
+
+
+# --- graph & summary commands ---------------------------------------------------
+
+
+@cli.command()
+@click.option("--max", "max_per_chain", type=click.IntRange(min=1), default=200, show_default=True,
               help="Maximum nodes per linear branch.")
 @click.pass_context
 def graph(ctx: click.Context, max_per_chain: int) -> None:
     """Render the Evolution Graph as a text tree."""
     try:
-        from nwt.storage.layout import open_workspace
-
-        ws = open_workspace(ctx.obj["root"])
-        g = build_graph(ws)
+        g = build_graph(_ws(ctx))
     except NWTError as e:
         _err(str(e))
         sys.exit(1)
@@ -249,27 +330,25 @@ def link(ctx: click.Context, source: str, target: str, relation: str) -> None:
 
 
 @cli.command()
-@click.option("--max-milestones", type=int, default=10, show_default=True)
+@click.option("--max-milestones", type=click.IntRange(min=0), default=10, show_default=True)
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
 @click.pass_context
 def story(ctx: click.Context, max_milestones: int, as_json: bool) -> None:
-    """Print a compressed project story (Phase 5)."""
+    """Print a compressed project story."""
     try:
-        from nwt.storage.layout import open_workspace
-
-        ws = open_workspace(ctx.obj["root"])
+        ws = _ws(ctx)
         events = timeline.list_events(root=ctx.obj["root"])
         graph_obj = build_graph(ws)
-        name = _read_project_name(ws)
         story_obj = build_story(
-            events, project_name=name, graph=graph_obj, max_milestones=max_milestones
+            events, project_name=ws.read_project_name(), graph=graph_obj,
+            max_milestones=max_milestones,
         )
     except NWTError as e:
         _err(str(e))
         sys.exit(1)
 
     if as_json:
-        click.echo(json.dumps(_story_to_json(story_obj), indent=2, ensure_ascii=False))
+        click.echo(json.dumps(story_obj.to_dict(), indent=2, ensure_ascii=False))
     else:
         click.echo(story_obj.to_text())
 
@@ -281,17 +360,14 @@ def story(ctx: click.Context, max_milestones: int, as_json: bool) -> None:
 def explain(ctx: click.Context, path: str, as_json: bool) -> None:
     """Explain why a file exists (created/modified/refactored)."""
     try:
-        from nwt.storage.layout import open_workspace
-
-        ws = open_workspace(ctx.obj["root"])
-        g = build_graph(ws)
-        result = explain_file(g, path)
+        g = build_graph(_ws(ctx))
+        result = explain_file_lineage(g, path)
     except NWTError as e:
         _err(str(e))
         sys.exit(1)
 
     if as_json:
-        click.echo(json.dumps(_explain_to_json(result), indent=2, ensure_ascii=False))
+        click.echo(json.dumps(to_json_dict(result), indent=2, ensure_ascii=False))
         return
 
     click.echo(f"# {result['file']}")
@@ -312,72 +388,82 @@ def explain(ctx: click.Context, path: str, as_json: bool) -> None:
 def rebuild_indices_cmd(ctx: click.Context) -> None:
     """Recompute the secondary search indices from the canonical event files."""
     try:
-        from nwt.storage.layout import open_workspace
-
-        ws = open_workspace(ctx.obj["root"])
-        rebuild_indices(ws)
+        rebuild_indices(_ws(ctx))
     except NWTError as e:
         _err(str(e))
         sys.exit(1)
     click.secho("indices rebuilt", fg="green")
 
 
-@cli.command()
-@click.argument("from_id")
-@click.argument("to_id")
+# --- git integration -------------------------------------------------------------
+
+
+@cli.command("install-git-hook")
+@click.option("--strict", is_flag=True,
+              help="Refuse to log commits without a 'Reason:' line.")
+@click.option("--ai-command", default=None,
+              help='Fill a missing Reason with an external model, e.g. "claude -p".')
 @click.pass_context
-def diff(ctx: click.Context, from_id: str, to_id: str) -> None:
-    """Show changes between two events."""
+def install_git_hook_cmd(ctx: click.Context, strict: bool, ai_command: str | None) -> None:
+    """Install the NWT post-commit hook into this repository."""
+    from nwt import githook
+
     try:
-        result = timeline.diff_events(from_id, to_id, root=ctx.obj["root"])
+        path = githook.install_hook(ctx.obj["root"], strict=strict, ai_command=ai_command)
     except NWTError as e:
         _err(str(e))
         sys.exit(1)
-
-    events = result["events"]
-    click.echo(f"Diff: [{events[0].short_id()}] → [{events[-1].short_id()}]")
-    click.echo(f"Events: {len(events)} between these points")
-    click.echo()
-
-    if result["files_added"]:
-        click.secho(f"Added: {', '.join(result['files_added'])}", fg="green")
-    if result["files_removed"]:
-        click.secho(f"Removed: {', '.join(result['files_removed'])}", fg="red")
-    if result["files_modified"]:
-        click.echo(f"Modified: {', '.join(result['files_modified'])}")
-
-    click.echo()
-    click.echo("Events in range:")
-    for ev in events:
-        click.echo(f"  [{ev.short_id()}] {_short_date(ev.timestamp)} {ev.task}")
+    click.secho(f"installed post-commit hook at {path}", fg="green")
+    click.echo("every commit will now be logged automatically; see docs/git-hook.md")
 
 
-@cli.command()
-@click.option("--time-window", type=int, default=3600, show_default=True,
-              help="Time window in seconds for grouping events.")
-@click.option("--min-group", type=int, default=3, show_default=True,
-              help="Minimum group size to compact.")
+@cli.command("git-hook-status")
 @click.pass_context
-def compact(ctx: click.Context, time_window: int, min_group: int) -> None:
-    """Merge consecutive events with same tags that are close in time."""
+def git_hook_status_cmd(ctx: click.Context) -> None:
+    """Show whether the NWT post-commit hook is installed and its flags."""
+    from nwt import githook
+
     try:
-        result = timeline.compact_events(
-            root=ctx.obj["root"],
-            time_window_seconds=time_window,
-            min_group_size=min_group,
-        )
+        status = githook.hook_status(ctx.obj["root"])
     except NWTError as e:
         _err(str(e))
         sys.exit(1)
-
-    if result["merged"] == 0:
-        click.echo("No events to compact.")
+    if status["hook_installed"]:
+        click.secho("post-commit hook: installed", fg="green")
+        if status["strict"]:
+            click.echo("  strict: yes")
+        if status["ai_command"]:
+            click.echo(f"  ai-command: {status['ai_command']}")
     else:
-        click.secho(
-            f"Compacted: {result['original_count']} → {result['compacted_count']} events "
-            f"(merged {result['merged']})",
-            fg="green",
-        )
+        click.echo("post-commit hook: not installed (run `nwt install-git-hook`)")
+    click.echo(
+        "workspace: initialized" if status["workspace_initialized"]
+        else "workspace: missing (run `nwt init`)"
+    )
+    if status["latest_event"]:
+        ev = status["latest_event"]
+        click.echo(f"latest event: [{ev['id']}] {ev['task']}")
+
+
+@cli.command("log-commit")
+@click.option("--strict", is_flag=True,
+              help="Fail instead of logging a commit without a 'Reason:' line.")
+@click.option("--ai-command", default=None,
+              help='Fill a missing Reason with an external model, e.g. "claude -p".')
+@click.pass_context
+def log_commit_cmd(ctx: click.Context, strict: bool, ai_command: str | None) -> None:
+    """Log the latest commit as a timeline event (used by the git hook)."""
+    from nwt import githook
+
+    try:
+        ev = githook.log_commit(ctx.obj["root"], strict=strict, ai_command=ai_command)
+    except NWTError as e:
+        _err(str(e))
+        sys.exit(1)
+    if ev is None:
+        click.echo("commit already logged; nothing to do")
+        return
+    click.secho(f"nwt: logged [{ev.short_id()}] {ev.task}", fg="green")
 
 
 # --- helpers -----------------------------------------------------------------
@@ -388,41 +474,6 @@ def _split_csv(value: str | None) -> list[str] | None:
         return None
     parts = [p.strip() for p in value.split(",")]
     return [p for p in parts if p] or None
-
-
-def _short_date(iso: str) -> str:
-    return iso[:10] if iso else ""
-
-
-def _read_project_name(ws) -> str | None:
-    try:
-        meta = json.loads(ws.metadata_file.read_text(encoding="utf-8"))
-        name = meta.get("project_name")
-        return name if isinstance(name, str) else None
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _story_to_json(story) -> dict:
-    return {
-        "project_name": story.project_name,
-        "first_event": story.first_event.to_dict() if story.first_event else None,
-        "last_event": story.last_event.to_dict() if story.last_event else None,
-        "event_count": story.event_count,
-        "spine_file": story.spine_file,
-        "milestones": [ev.to_dict() for ev in story.milestones],
-        "decisions": [ev.to_dict() for ev in story.decisions],
-    }
-
-
-def _explain_to_json(result: dict) -> dict:
-    return {
-        "file": result["file"],
-        "created_in": result["created_in"],
-        "modified_in": result["modified_in"],
-        "reason": result["reason"],
-        "events": [ev.to_dict() for ev in result["events"]],
-    }
 
 
 if __name__ == "__main__":  # pragma: no cover

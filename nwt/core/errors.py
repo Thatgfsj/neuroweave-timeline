@@ -31,5 +31,16 @@ class ValidationError(NWTError):
     """Raised when an event payload fails schema validation."""
 
 
+class CorruptEventError(NWTError):
+    """Raised when an event file on disk cannot be parsed."""
+
+    def __init__(self, path) -> None:
+        super().__init__(
+            f"corrupt event file: {path} (fix or remove the file, or restore "
+            "the timeline from the most recent .nwt/snapshots backup)"
+        )
+        self.path = path
+
+
 class RelationError(NWTError):
     """Raised when a relation cannot be created (unknown type, missing node, etc.)."""

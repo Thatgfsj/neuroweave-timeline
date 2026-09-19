@@ -27,11 +27,14 @@ from mcp.server.fastmcp import FastMCP
 
 from nwt import __version__
 from nwt.core.errors import NWTError
+from nwt.graph import lineage
 from nwt.graph.builder import build_graph
-from nwt.graph.lineage import explain_file
 from nwt.storage.layout import Workspace, open_workspace
 from nwt.timeline import engine as timeline
 from nwt.timeline.summary import build_story
+
+__all__ = ["mcp", "main", "create_event", "search_history",
+           "get_project_story", "explain_file"]
 
 
 def _resolve_root() -> Path:
@@ -70,6 +73,7 @@ def create_event(
     files: list[str] | None = None,
     tags: list[str] | None = None,
     parent: str | None = None,
+    importance: str = "normal",
 ) -> dict[str, Any]:
     """Append a new event to the project's timeline.
 
@@ -80,8 +84,10 @@ def create_event(
             what turns NWT from a log into a *history*.
         files: Project-relative file paths this event touched.
         tags: Free-form labels (e.g. ``["memory", "optimization"]``).
-        parent: Id of the preceding event in the linear chain, or null
-            to start a new branch.
+        parent: Chain placement. Omit or pass "auto" to append after the
+            latest event; pass "none" to start a new branch; or pass an
+            event id to continue after that specific event.
+        importance: One of "low", "normal", "high", "milestone".
 
     Returns:
         The persisted event as a dict (including its allocated id and
@@ -93,7 +99,8 @@ def create_event(
         reason=reason,
         files=files,
         tags=tags,
-        parent=parent,
+        parent=parent if parent is not None else timeline.PARENT_AUTO,
+        importance=importance,
         root=_resolve_root(),
     )
     return ev.to_dict()
@@ -114,7 +121,7 @@ def search_history(
     Args:
         query: Substring to search for (case-insensitive). Matched against
             task, summary, reason, file paths, and tags.
-        limit: Cap on the number of results.
+        limit: Cap on the number of results (applied after narrowing).
         search_files: Include file paths in the search.
         search_tags: Include tags in the search.
 
@@ -122,9 +129,14 @@ def search_history(
         A list of matching events, ordered by id ascending. Each event
         is a dict; see ``create_event`` for the field set.
     """
-    events = timeline.search(query, root=_resolve_root(), limit=limit)
+    # Fetch all matches, narrow by scope, then apply the limit — a limit
+    # taken before the scope filter would silently under-return. A
+    # negative limit is treated as unlimited rather than a Python
+    # negative slice.
+    if limit is not None and limit < 0:
+        limit = None
+    events = timeline.search(query, root=_resolve_root(), limit=None)
     if not (search_files and search_tags):
-        # Re-filter when caller wants a narrower scope.
         q = query.strip().lower()
         out: list = []
         for ev in events:
@@ -136,6 +148,8 @@ def search_history(
             if any(q in h.lower() for h in haystacks):
                 out.append(ev)
         events = out
+    if limit is not None:
+        events = events[:limit]
     return [ev.to_dict() for ev in events]
 
 
@@ -151,28 +165,22 @@ def get_project_story(max_milestones: int = 10) -> dict[str, Any]:
         * up to ``max_milestones`` milestone events
         * the file that changed most often (the "spine file")
         * all decision events (those with a non-empty reason)
+        * events flagged high or milestone importance
 
     Returns:
-        A dict mirroring the structure of :class:`ProjectStory`, plus a
+        A dict mirroring :class:`ProjectStory.to_dict`, plus a
         human-readable ``text`` rendering for direct LLM consumption.
     """
     ws = _open_or_error()
     events = timeline.list_events(root=_resolve_root())
     g = build_graph(ws)
-    name = _read_project_name(ws)
     story = build_story(
-        events, project_name=name, graph=g, max_milestones=max_milestones
+        events, project_name=ws.read_project_name(), graph=g,
+        # A negative cap means "unlimited", matching search_history —
+        # a raw negative used to silently slice off milestones.
+        max_milestones=max_milestones if max_milestones >= 0 else None,
     )
-    return {
-        "project_name": story.project_name,
-        "event_count": story.event_count,
-        "first_event": story.first_event.to_dict() if story.first_event else None,
-        "last_event": story.last_event.to_dict() if story.last_event else None,
-        "spine_file": story.spine_file,
-        "milestones": [ev.to_dict() for ev in story.milestones],
-        "decisions": [ev.to_dict() for ev in story.decisions],
-        "text": story.to_text(),
-    }
+    return {**story.to_dict(), "text": story.to_text()}
 
 
 # --- tool: explain_file -------------------------------------------------------
@@ -201,7 +209,10 @@ def explain_file(file_path: str) -> dict[str, Any]:
     """
     ws = _open_or_error()
     g = build_graph(ws)
-    result = explain_file(g, file_path)
+    # Note: call the lineage helper explicitly — a bare ``explain_file``
+    # here would resolve to this tool (that shadowing once made the tool
+    # crash on every call).
+    result = lineage.explain_file(g, file_path)
 
     lines = [f"# {result['file']}"]
     if result["created_in"] is not None:
@@ -218,27 +229,9 @@ def explain_file(file_path: str) -> dict[str, Any]:
         lines.append(f"  - [{ev.short_id()}] {ev.task}  ({ev.summary})")
 
     return {
-        "file": result["file"],
-        "created_in": result["created_in"],
-        "modified_in": result["modified_in"],
-        "reason": result["reason"],
-        "events": [ev.to_dict() for ev in result["events"]],
+        **lineage.to_json_dict(result),
         "text": "\n".join(lines) + "\n",
     }
-
-
-# --- helpers -----------------------------------------------------------------
-
-
-def _read_project_name(ws: Workspace) -> str | None:
-    import json
-
-    try:
-        meta = json.loads(ws.metadata_file.read_text(encoding="utf-8"))
-        name = meta.get("project_name")
-        return name if isinstance(name, str) else None
-    except (OSError, json.JSONDecodeError):
-        return None
 
 
 # --- entry point --------------------------------------------------------------

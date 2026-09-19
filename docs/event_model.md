@@ -22,14 +22,15 @@ a bug fix — becomes a **Timeline Event**. Events are the atoms of NWT.
 
 | Field        | Type           | Required | Notes                                        |
 |--------------|----------------|:--------:|----------------------------------------------|
-| `id`         | string         |    ✅    | 6-digit zero-padded, allocated by the engine |
-| `timestamp`  | ISO 8601 UTC   |    ✅    | `Z` suffix or `+00:00` both accepted         |
-| `task`       | string         |    ✅    | Short imperative title                       |
-| `summary`    | string         |    ✅    | What was done, in 1–2 sentences             |
+| `id`         | string         |    yes   | 6-digit zero-padded, allocated by the engine |
+| `timestamp`  | ISO 8601 UTC   |    yes   | `Z` suffix or `+00:00` both accepted         |
+| `task`       | string         |    yes   | Short imperative title                       |
+| `summary`    | string         |    yes   | What was done, in 1–2 sentences             |
 | `reason`     | string         |          | **Why** it was done — encouraged             |
-| `files`      | list of string |          | Project-relative paths touched               |
+| `files`      | list of string |          | Project-relative paths touched, normalized to POSIX separators on save |
 | `tags`       | list of string |          | Lowercased on save                           |
 | `parent`     | string         |          | Id of preceding event in the linear chain    |
+| `importance` | string         |          | `low` / `normal` (default) / `high` / `milestone` |
 | `meta`       | object         |          | Escape hatch for forward-compatible fields   |
 
 ### Why `reason` matters
@@ -52,8 +53,10 @@ linear chain. It produces the default narrative spine of the project:
 event 1  →  event 2  →  event 3  →  event 4
 ```
 
-You can omit `parent` to start a new branch (e.g. an experiment that
-later becomes the main line, or a feature branch).
+By default the engine chains automatically: an event created without a
+`parent` (or with `--parent` omitted) is appended after the latest
+event. To start a new branch — e.g. an experiment that later becomes
+the main line, or a feature branch — pass `--parent none` explicitly.
 
 ## Typed edges: `nwt link`
 

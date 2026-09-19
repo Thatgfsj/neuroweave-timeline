@@ -40,8 +40,13 @@ jobs:
           nwt init
           nwt log "Project created" --reason kickoff
           nwt log "Add activation" --files activation.py --reason retrieval --parent 1
+          nwt log "Third event"
           nwt link 1 2 --relation extends
           nwt history
           nwt graph
           nwt story
           nwt explain activation.py
+          nwt diff 1 2
+          nwt compact --dry-run
+          nwt git-hook-status
+          test "$(nwt --version)" = "nwt $(python -c 'import tomllib, pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"

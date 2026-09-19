@@ -1,4 +1,4 @@
-# 🧠 NeuroWeave Timeline (NWT)
+# NeuroWeave Timeline (NWT)
 
 > **Process memory for AI agents and humans.**
 > NWT remembers how a project became what it is — not just what it is now.
@@ -25,7 +25,7 @@ project looks the way it does today.
 
 ---
 
-## 💬 What you can ask
+## What you can ask
 
 | Question | One-liner |
 |---|---|
@@ -40,7 +40,7 @@ project looks the way it does today.
 
 AI agents reach the same answers over MCP — see [MCP integration](#-mcp-integration).
 
-## 🌱 Auto-grow: timeline from `git commit`
+## Auto-grow: timeline from `git commit`
 
 The single biggest reason NWT timelines are empty is friction. The
 v0.2 fix is a post-commit hook that logs an event on every commit
@@ -59,7 +59,7 @@ when the human didn't. See [`docs/git-hook.md`](docs/git-hook.md).
 
 ---
 
-## 🚀 30-second quick start
+## 30-second quick start
 
 ```bash
 pip install -e .
@@ -77,7 +77,7 @@ embeddings, no vendor lock-in, no daemon.
 
 ---
 
-## 👀 A tour of the output
+## A tour of the output
 
 ### `nwt history` — what happened, in order
 
@@ -148,7 +148,14 @@ reason:
 
 ---
 
-## 🆕 New features (v0.3)
+## New in v0.2
+
+### Events chain automatically
+
+`nwt log` appends after the latest event by default, so a plain
+sequence of logs forms one linear history. Start an explicit branch
+with `--parent none`, or continue after a specific event with
+`--parent ID`.
 
 ### Event importance
 
@@ -159,7 +166,7 @@ nwt log "Fix login bug" --summary "..." --importance high
 nwt log "Project launched" --summary "..." --importance milestone
 ```
 
-The `story` command groups events by importance.
+The `story` command reports events grouped by importance.
 
 ### `nwt diff` — compare two events
 
@@ -169,7 +176,8 @@ nwt diff 1 5
 # Diff: [1] → [5]
 # Events: 5 between these points
 # Added: new_feature.py
-# Modified: main.py
+# Removed: old_feature.py
+# In both (likely modified): main.py
 ```
 
 ### `nwt compact` — merge small events
@@ -179,15 +187,21 @@ When you have many small consecutive events with the same tags, compact them:
 ```bash
 nwt compact
 # Compacted: 50 → 35 events (merged 15)
+# backup: .nwt/snapshots/pre-compact-20260920T120000
 ```
 
 Options:
 - `--time-window 3600` — group events within 1 hour (default)
 - `--min-group 3` — minimum group size to merge (default)
+- `--dry-run` — preview the merge without touching disk
+
+Compact backs up `timeline/`, `relations/` and the counter to
+`.nwt/snapshots/` before rewriting, and remaps parents, typed
+relations, indices, and the id counter onto the renumbered events.
 
 ---
 
-## 🧩 How it works
+## How it works
 
 NWT lives in your project as a single `.nwt/` directory:
 
@@ -201,7 +215,7 @@ your-project/
     │   ├── 000002.json
     │   └── ...
     ├── relations/          # typed edges out of each source event
-    ├── snapshots/          # reserved for v0.2
+    ├── snapshots/          # pre-compact backups land here
     └── indices/            # derived, rebuildable
         ├── files.json
         └── tags.json
@@ -213,7 +227,7 @@ Everything is JSON, atomically written. The whole workspace is
 
 ---
 
-## 🔌 MCP integration
+## MCP integration
 
 For agent developers — NWT ships an MCP server exposing the same
 answers as tools:
@@ -248,7 +262,7 @@ cwd. See [`docs/mcp.md`](docs/mcp.md) for the recommended agent loop:
 
 ---
 
-## 📦 安装
+## 安装
 
 ```bash
 # from a clone (editable)
@@ -271,14 +285,14 @@ pytest -q
 
 ---
 
-## 🗺️ Roadmap
+## Roadmap
 
-v0.2 (this release) is the "auto-grow" cut: git hook integration,
-strict mode, file biography, and event templates. The timeline
-fills itself now.
+v0.2 (this release) is the "auto-grow" cut: git hook integration with
+strict mode and AI-filled reasons, automatic event chaining, the
+importance field, `diff`, and `compact`. The timeline fills itself now.
 
-- **v0.3** — agent integration. Drive NWT through Claude Code,
-  Cursor, and OpenAI Agents to find the gaps.
+- **v0.3** — snapshots (`nwt snapshot` / `nwt restore`) and deeper git
+  linkage (commit SHAs on every event, `nwt rewind`).
 - **v0.4** — multi-agent collaboration history (concurrency-safe
   writes, per-author identity).
 - **v0.5** — NWC integration, *only if NWT earns it on its own*.
@@ -288,7 +302,7 @@ See [`docs/roadmap.md`](docs/roadmap.md) and
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Issues and PRs are welcome. The whole project is ~1,500 lines of
 Python plus docs — easy to read end-to-end. Start with
@@ -297,7 +311,7 @@ Python plus docs — easy to read end-to-end. Start with
 
 ---
 
-## 🔒 Security
+## Security
 
 NWT stores only what you give it, on disk, in your project's `.nwt/`.
 It does not phone home, does not read environment variables other
@@ -307,6 +321,6 @@ to track tokens, keys, or `.env` files. See
 
 ---
 
-## 📄 License
+## License
 
 MIT — see [LICENSE](LICENSE).

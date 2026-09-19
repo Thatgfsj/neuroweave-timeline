@@ -8,18 +8,28 @@ read or write ``.nwt/`` files directly.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from uuid import uuid4
 
-from nwt.core.errors import ValidationError
-from nwt.core.event import TimelineEvent
-from nwt.core.ids import parse_id
+from nwt.core.errors import EventNotFoundError, ValidationError
+from nwt.core.event import TimelineEvent, normalize_file
+from nwt.core.ids import ID_WIDTH, canonical
 from nwt.core.relations import Relation
+from nwt.core.time import parse_iso
+from nwt.storage.indices import IndexStore
 from nwt.storage.layout import Workspace, open_workspace
-from nwt.storage.reader import read_all_events, read_all_relations, read_event, read_relations
-from nwt.storage.writer import write_event, write_relation
+from nwt.storage.reader import read_all_events, read_all_relations, read_event
+from nwt.storage.writer import next_free_id, reset_counter, write_event, write_relation
+
+#: Sentinel: append after the latest event (the default).
+PARENT_AUTO = "auto"
+
+#: Sentinel: explicitly start a new branch (no parent).
+PARENT_NONE = "none"
+
+_COMPACT_BACKUP_PREFIX = "pre-compact-"
 
 
 def _resolve_workspace(root: str | Path | None = None) -> Workspace:
@@ -39,7 +49,7 @@ def create_event(
     reason: str | None = None,
     files: Iterable[str] | None = None,
     tags: Iterable[str] | None = None,
-    parent: str | None = None,
+    parent: str | None = PARENT_AUTO,
     importance: str = "normal",
     timestamp: str | None = None,
     meta: dict | None = None,
@@ -48,8 +58,13 @@ def create_event(
     """Append a new event to the project's timeline.
 
     Returns the persisted event, complete with allocated id and timestamp.
-    Use ``parent=<id>`` to continue an existing chain; omit it to start a
-    new branch.
+
+    ``parent`` controls chain placement:
+
+    * ``"auto"`` or ``None`` (default) — append after the latest event,
+      so a plain sequence of ``nwt log`` calls forms one linear history.
+    * ``"none"`` — start a new branch (no parent).
+    * an event id — continue after that specific event.
     """
     if not task or not task.strip():
         raise ValidationError("'task' is required and must be non-empty")
@@ -63,7 +78,7 @@ def create_event(
         reason=reason.strip() if reason else None,
         files=files,
         tags=tags,
-        parent=parent,
+        parent=_resolve_parent(ws, parent),
         importance=importance,
         timestamp=timestamp,
         meta=meta,
@@ -71,11 +86,36 @@ def create_event(
     return write_event(ws, ev)
 
 
+def _resolve_parent(ws: Workspace, parent: str | None) -> str | None:
+    """Interpret the ``parent`` argument (see :func:`create_event`)."""
+    if parent is None:
+        spec = PARENT_AUTO
+    else:
+        spec = parent.strip()
+        if spec.lower() == PARENT_AUTO:
+            spec = PARENT_AUTO
+        elif spec.lower() == PARENT_NONE:
+            return None
+
+    if spec == PARENT_AUTO:
+        events = read_all_events(ws)
+        if not events:
+            return None
+        return max(events, key=lambda e: int(e.id)).id
+
+    try:
+        resolved = canonical(spec)
+    except ValueError as e:
+        raise ValidationError(f"invalid parent id {parent!r}: {e}") from e
+    if not ws.event_file(resolved).is_file():
+        raise EventNotFoundError(resolved)
+    return resolved
+
+
 def get_event(event_id: str, *, root: str | Path | None = None) -> TimelineEvent:
     """Fetch a single event by id (with or without zero padding)."""
     ws = _resolve_workspace(root)
-    canonical = _canonical_id(ws, event_id)
-    return read_event(ws, canonical)
+    return read_event(ws, _canonical_id(ws, event_id))
 
 
 def list_events(
@@ -86,6 +126,10 @@ def list_events(
     reverse: bool = False,
 ) -> list[TimelineEvent]:
     """Return all events in id order (``reverse=True`` for newest first)."""
+    if limit is not None and limit < 0:
+        raise ValidationError("limit must be >= 0")
+    if offset < 0:
+        raise ValidationError("offset must be >= 0")
     ws = _resolve_workspace(root)
     events = read_all_events(ws)
     events.sort(key=lambda e: e.id, reverse=reverse)
@@ -109,62 +153,60 @@ def search(
     """
     if not query or not query.strip():
         return []
+    if limit is not None and limit < 0:
+        raise ValidationError("limit must be >= 0")
     ws = _resolve_workspace(root)
     q = query.strip().lower()
     out: list[TimelineEvent] = []
     for ev in read_all_events(ws):
         if _matches(ev, q):
             out.append(ev)
-        if limit is not None and len(out) >= limit:
-            break
+            if limit is not None and len(out) >= limit:
+                break
     return out
 
 
 def search_by_file(path: str, *, root: str | Path | None = None) -> list[TimelineEvent]:
     """Return every event that touched the given file path.
 
-    Uses the ``files`` index when available, falling back to a full scan.
+    The query is normalized the same way the stored paths are
+    (:func:`nwt.core.event.normalize_file`), so ``src\\foo.py`` and
+    ``./src/foo.py`` find the event that logged ``src/foo.py``. Uses the
+    ``files`` index when available, falling back to a full scan.
     """
     ws = _resolve_workspace(root)
-    idx = ws.nwt_dir / "indices" / "files.json"
-    if idx.is_file():
-        try:
-            data = json.loads(idx.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
-        ids = data.get(path) or []
-        if ids:
-            out: list[TimelineEvent] = []
-            for eid in ids:
-                try:
-                    out.append(read_event(ws, eid))
-                except Exception:
-                    continue
-            return out
-    # Fallback: scan.
-    return [ev for ev in read_all_events(ws) if path in ev.files]
+    key = normalize_file(path)
+    ids = IndexStore(ws).by_file(key)
+    if not ids and key != path:
+        ids = IndexStore(ws).by_file(path)  # pre-normalization data
+    if ids:
+        out: list[TimelineEvent] = []
+        for eid in ids:
+            try:
+                out.append(read_event(ws, eid))
+            except Exception:
+                continue
+        return out
+    # Fallback: scan (compare normalized forms).
+    return [
+        ev for ev in read_all_events(ws)
+        if any(normalize_file(f) == key for f in ev.files)
+    ]
 
 
 def search_by_tag(tag: str, *, root: str | Path | None = None) -> list[TimelineEvent]:
     """Return every event carrying ``tag`` (case-insensitive)."""
     ws = _resolve_workspace(root)
-    idx = ws.nwt_dir / "indices" / "tags.json"
-    needle = tag.strip().lower()
-    if idx.is_file():
-        try:
-            data = json.loads(idx.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
-        ids = data.get(needle) or []
-        if ids:
-            out: list[TimelineEvent] = []
-            for eid in ids:
-                try:
-                    out.append(read_event(ws, eid))
-                except Exception:
-                    continue
-            return out
-    return [ev for ev in read_all_events(ws) if needle in ev.tags]
+    ids = IndexStore(ws).by_tag(tag.strip().lower())
+    if ids:
+        out: list[TimelineEvent] = []
+        for eid in ids:
+            try:
+                out.append(read_event(ws, eid))
+            except Exception:
+                continue
+        return out
+    return [ev for ev in read_all_events(ws) if tag.strip().lower() in ev.tags]
 
 
 def link(
@@ -200,33 +242,46 @@ def diff_events(
 ) -> dict:
     """Compare two events and return the changes between them.
 
+    ``from_id`` must precede ``to_id`` in the timeline; anything else
+    raises :class:`ValidationError` instead of silently returning an
+    empty range.
+
     Returns a dict with:
-      - events: list of events between from and to
+      - events: list of events between from and to (inclusive)
       - files_added: files present in to but not in from
       - files_removed: files present in from but not in to
-      - files_modified: files present in both
+      - files_in_both: files touched by both endpoint events (i.e.
+        likely modified somewhere in between)
     """
     ws = _resolve_workspace(root)
     from_event = read_event(ws, _canonical_id(ws, from_id))
     to_event = read_event(ws, _canonical_id(ws, to_id))
 
+    if from_event.id == to_event.id:
+        raise ValidationError("cannot diff an event with itself")
+
     all_events = read_all_events(ws)
     all_events.sort(key=lambda e: e.id)
 
-    from_idx = next((i for i, e in enumerate(all_events) if e.id == from_event.id), 0)
-    to_idx = next((i for i, e in enumerate(all_events) if e.id == to_event.id), len(all_events) - 1)
+    ids = [e.id for e in all_events]
+    from_idx = ids.index(from_event.id)
+    to_idx = ids.index(to_event.id)
+    if from_idx > to_idx:
+        raise ValidationError(
+            f"event {from_event.short_id()} comes after {to_event.short_id()}; "
+            "pass the earlier event id first"
+        )
 
     between = all_events[from_idx:to_idx + 1]
 
     from_files = set(from_event.files)
     to_files = set(to_event.files)
-    all_files = set(f for e in between for f in e.files)
 
     return {
         "events": between,
         "files_added": sorted(to_files - from_files),
         "files_removed": sorted(from_files - to_files),
-        "files_modified": sorted(from_files & to_files),
+        "files_in_both": sorted(from_files & to_files),
     }
 
 
@@ -235,6 +290,7 @@ def compact_events(
     root: str | Path | None = None,
     time_window_seconds: int = 3600,
     min_group_size: int = 3,
+    dry_run: bool = False,
 ) -> dict:
     """Merge consecutive events with the same tags that are close in time.
 
@@ -242,97 +298,196 @@ def compact_events(
     - Same tags
     - Within time_window_seconds (default 1 hour)
 
-    If a group has min_group_size or more events, they are merged into one.
-    Returns a dict with original_count, compacted_count, merged.
+    If a group has min_group_size or more events, they are merged into
+    one. This is a destructive rewrite of the canonical store, so the
+    implementation:
+
+    1. backs up ``timeline/``, ``relations/`` and the counter to
+       ``.nwt/snapshots/pre-compact-<ts>/``,
+    2. renumbers the surviving events from 1,
+    3. remaps ``parent`` fields and typed relations onto the new ids
+       (a merged group's members all remap to the merged event),
+    4. rebuilds indices and resets the counter.
+
+    Pass ``dry_run=True`` to compute the result without touching disk.
+    Returns a dict with original_count, compacted_count, merged,
+    dry_run, and backup (path of the safety copy, or None).
     """
+    if min_group_size < 2:
+        raise ValidationError("min_group_size must be >= 2 (a group of 1 cannot merge)")
+    if time_window_seconds < 0:
+        raise ValidationError("time_window_seconds must be >= 0")
+
     ws = _resolve_workspace(root)
     events = read_all_events(ws)
+    # Read relations before any destructive step: a corrupt relations
+    # file must not leave the rewrite half-applied (the tolerant reader
+    # skips malformed files with a warning; the backup preserves them).
+    old_relations = read_all_relations(ws)
     events.sort(key=lambda e: e.id)
 
+    no_change = {
+        "original_count": len(events),
+        "compacted_count": len(events),
+        "merged": 0,
+        "dry_run": dry_run,
+        "backup": None,
+    }
     if len(events) < min_group_size:
-        return {"original_count": len(events), "compacted_count": len(events), "merged": 0}
+        return no_change
 
-    # Group consecutive events with same tags
+    # Group consecutive events with same tags, close in time.
     groups: list[list[TimelineEvent]] = [[events[0]]]
-
     for i in range(1, len(events)):
         prev = events[i - 1]
         curr = events[i]
-
         same_tags = sorted(curr.tags) == sorted(prev.tags)
         try:
-            prev_time = _parse_iso(prev.timestamp)
-            curr_time = _parse_iso(curr.timestamp)
-            time_diff = (curr_time - prev_time).total_seconds()
+            time_diff = (parse_iso(curr.timestamp) - parse_iso(prev.timestamp)).total_seconds()
         except (ValueError, TypeError):
-            time_diff = float('inf')
-
+            time_diff = float("inf")
         if same_tags and time_diff < time_window_seconds:
             groups[-1].append(curr)
         else:
             groups.append([curr])
 
-    # Merge groups
-    merged = 0
-    new_events: list[TimelineEvent] = []
+    if not any(len(g) >= min_group_size for g in groups):
+        return no_change
 
+    # Build the surviving event list under fresh ids (1..N) plus an
+    # old-id → new-id mapping. Every old id maps to some new id (merged
+    # members map to the group's merged representative), so parents and
+    # relations stay connected.
+    new_events: list[TimelineEvent] = []
+    sources: list[list[str]] = []  # old ids each new event stands for
+    counter = 0
     for group in groups:
         if len(group) >= min_group_size:
-            first = group[0]
-            last = group[-1]
-            all_files = list(dict.fromkeys(f for e in group for f in e.files))
-
+            first, last = group[0], group[-1]
+            counter += 1
+            meta = dict(first.meta)
+            meta["compacted"] = [e.id for e in group]
             new_events.append(TimelineEvent.create(
                 task=f"{first.task} ... {last.task}",
                 summary=f"Compacted {len(group)} events: {', '.join(e.task for e in group)}",
-                files=all_files,
+                reason=first.reason,
+                files=list(dict.fromkeys(f for e in group for f in e.files)),
                 tags=first.tags,
                 importance=first.importance,
                 parent=first.parent,
+                event_id=format_compact_id(counter),
                 timestamp=first.timestamp,
+                meta=meta,
             ))
-            merged += len(group) - 1
+            sources.append([e.id for e in group])
         else:
-            new_events.extend(group)
+            for ev in group:
+                counter += 1
+                sources.append([ev.id])
+                ev.id = format_compact_id(counter)
+                new_events.append(ev)
 
-    if merged == 0:
-        return {"original_count": len(events), "compacted_count": len(events), "merged": 0}
+    id_map: dict[str, str] = {}
+    for ev, old_ids in zip(new_events, sources):
+        for old_id in old_ids:
+            id_map[old_id] = ev.id
 
-    # Re-write events
-    from nwt.storage.writer import write_event
-    # Clear existing events by removing files
-    events_dir = ws.nwt_dir / "events"
-    for f in events_dir.glob("*.json"):
-        f.unlink()
+    # Remap parents onto the new id space; drop self-references and
+    # dangling ids left over from hand-edited timelines.
+    for ev in new_events:
+        if ev.parent is not None:
+            ev.parent = id_map.get(ev.parent)
+            if ev.parent == ev.id:
+                ev.parent = None
 
-    # Write new events with re-numbered IDs
-    for i, ev in enumerate(new_events):
-        ev.id = str(i + 1).zfill(6)
-        write_event(ws, ev)
+    merged = len(events) - len(new_events)
+    if dry_run:
+        return {
+            "original_count": len(events),
+            "compacted_count": len(new_events),
+            "merged": merged,
+            "dry_run": True,
+            "backup": None,
+        }
 
-    return {"original_count": len(events), "compacted_count": len(new_events), "merged": merged}
+    # 1. Safety backup of everything the rewrite touches. The name
+    # carries a uniquifier: two compacts within the same second (two
+    # processes, or a retry) must not race on one backup directory.
+    backup_dir = ws.snapshots_dir / (
+        _COMPACT_BACKUP_PREFIX
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        + "-" + uuid4().hex[:8]
+    )
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+
+    shutil.copytree(ws.timeline_dir, backup_dir / "timeline", dirs_exist_ok=True)
+    if ws.relations_dir.is_dir():
+        shutil.copytree(ws.relations_dir, backup_dir / "relations", dirs_exist_ok=True)
+    if ws.counter_file.is_file():
+        shutil.copy2(ws.counter_file, backup_dir / ".counter.json")
+
+    # 2. Rewrite the canonical store under the new id space. Parent
+    # checks are off because a (hand-crafted) forward reference may
+    # legitimately point at a file written later in the same pass.
+    for old_file in ws.timeline_dir.glob("*.json"):
+        if not old_file.name.startswith("."):
+            old_file.unlink()
+    for ev in new_events:
+        write_event(ws, ev, check_parent=False)
+
+    # 3. Rewrite relations in the new id space. Edges pointing at events
+    # merged into a group collapse onto the group's representative;
+    # self-loops created by that collapse are dropped.
+    if ws.relations_dir.is_dir():
+        for rel_file in ws.relations_dir.glob("*.json"):
+            if not rel_file.name.startswith("."):
+                rel_file.unlink()
+    seen_edges: set[tuple[str, str, Relation]] = set()
+    for old_source, edges in old_relations.items():
+        new_source = id_map.get(old_source)
+        if new_source is None:
+            continue
+        for old_target, relation in edges:
+            new_target = id_map.get(old_target)
+            if new_target is None or new_target == new_source:
+                continue
+            key = (new_source, new_target, relation)
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            write_relation(ws, new_source, new_target, relation)
+
+    # 4. Derived data: fresh indices and a counter that matches reality.
+    IndexStore(ws).rebuild()
+    reset_counter(ws, len(new_events) + 1)
+
+    return {
+        "original_count": len(events),
+        "compacted_count": len(new_events),
+        "merged": merged,
+        "dry_run": False,
+        "backup": str(backup_dir),
+    }
+
+
+def format_compact_id(n: int) -> str:
+    """Zero-pad a renumbered id using the canonical width."""
+    return str(n).zfill(ID_WIDTH)
 
 
 # --- helpers -----------------------------------------------------------------
 
 
 def _canonical_id(ws: Workspace, value: str) -> str:
-    """Accept ids with or without leading zeros."""
+    """Accept ids with or without leading zeros; verify existence."""
     try:
-        n = parse_id(value)
+        resolved = canonical(value)
     except ValueError as e:
         raise ValidationError(str(e)) from e
-    if not ws.event_file(_zfill(n)).is_file():
-        from nwt.core.errors import EventNotFoundError
-
-        raise EventNotFoundError(_zfill(n))
-    return _zfill(n)
-
-
-def _zfill(n: int) -> str:
-    from nwt.core.ids import ID_WIDTH
-
-    return str(n).zfill(ID_WIDTH)
+    if not ws.event_file(resolved).is_file():
+        raise EventNotFoundError(resolved)
+    return resolved
 
 
 def _matches(ev: TimelineEvent, q: str) -> bool:
@@ -344,11 +499,3 @@ def _matches(ev: TimelineEvent, q: str) -> bool:
         " ".join(ev.tags).lower(),
     ]
     return any(q in h for h in haystacks)
-
-
-def _parse_iso(value: str) -> datetime:
-    """Parse an ISO 8601 timestamp, accepting a trailing ``Z``."""
-    s = value.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)

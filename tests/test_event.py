@@ -114,3 +114,52 @@ def test_create_assigns_id_and_timestamp() -> None:
     ev = TimelineEvent.create(task="t", summary="s")
     assert ev.id == ""  # engine will allocate; factory leaves it empty
     assert ev.timestamp  # populated
+
+
+def test_files_normalized_to_posix() -> None:
+    ev = TimelineEvent.create(
+        task="t", summary="s", files=["src\\foo.py", "./a/b.py", "src/foo.py", ""]
+    )
+    # Backslashes and ./ prefixes collapse into one canonical key; the
+    # duplicate and the empty entry disappear.
+    assert ev.files == ["src/foo.py", "a/b.py"]
+
+
+def test_from_dict_normalizes_files() -> None:
+    ev = TimelineEvent.from_json(
+        '{"id":"000001","timestamp":"2026-06-15T10:00:00Z",'
+        '"task":"t","summary":"s","files":["a\\\\b.py"]}'
+    )
+    assert ev.files == ["a/b.py"]
+
+
+def test_create_rejects_non_string_file() -> None:
+    from nwt.core.errors import ValidationError
+
+    with pytest.raises(ValidationError, match="file must be a string"):
+        TimelineEvent.create(task="t", summary="s", files=[42])
+
+
+def test_importance_degrades_to_normal() -> None:
+    ev = TimelineEvent.create(task="t", summary="s", importance="URGENT")
+    assert ev.importance == "normal"
+    ok = TimelineEvent.create(task="t", summary="s", importance="milestone")
+    assert ok.importance == "milestone"
+
+
+def test_create_rejects_invalid_timestamp() -> None:
+    # Round-2 red team: a bad timestamp used to be stored verbatim and
+    # poison every later read of the timeline.
+    with pytest.raises(ValidationError, match="invalid timestamp"):
+        TimelineEvent.create(task="t", summary="s", timestamp="not-a-date")
+
+
+def test_from_dict_still_rejects_bad_timestamp() -> None:
+    bad = {
+        "id": "000001",
+        "timestamp": "not-a-date",
+        "task": "x",
+        "summary": "y",
+    }
+    with pytest.raises(ValidationError, match="invalid timestamp"):
+        TimelineEvent.from_dict(bad)

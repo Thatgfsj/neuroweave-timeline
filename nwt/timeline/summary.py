@@ -10,6 +10,8 @@ Milestone selection score::
     score(e) = descendants(e) * 2
              + (5 if 'milestone' in e.tags else 0)
              + (5 if 'release'   in e.tags else 0)
+             + (5 if e.importance == 'milestone' else 0)
+             + (3 if e.importance == 'high'      else 0)
              + (2 if e.reason           else 0)
              + (1 if e.files            else 0)
 
@@ -17,22 +19,28 @@ The top ``max_milestones`` events by score become the project's
 milestones. Ties are broken by id order (older wins) so the output is
 stable across runs.
 
+Descendant counts for every event are computed in one O(V+E) pass using
+integer bitsets propagated in reverse topological order — equivalent to
+running a BFS per event (which was O(V·(V+E))) but fast enough for
+five-figure timelines.
+
 The *project story* is a structured bundle:
 
 * project name + first/last event timestamps
 * ordered list of milestones
 * the file that changed most often (the "spine file")
 * the set of decision events (those with a non-empty ``reason``)
+* events flagged ``high`` or ``milestone`` importance
 """
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Iterable
 
 from nwt.core.event import TimelineEvent
+from nwt.core.time import short_date as _short_date
 from nwt.graph.builder import EvolutionGraph
 
 
@@ -47,6 +55,20 @@ class ProjectStory:
     milestones: list[TimelineEvent] = field(default_factory=list)
     spine_file: str | None = None
     decisions: list[TimelineEvent] = field(default_factory=list)
+    important: list[TimelineEvent] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """JSON-ready form shared verbatim by the CLI and MCP surfaces."""
+        return {
+            "project_name": self.project_name,
+            "first_event": self.first_event.to_dict() if self.first_event else None,
+            "last_event": self.last_event.to_dict() if self.last_event else None,
+            "event_count": self.event_count,
+            "spine_file": self.spine_file,
+            "milestones": [ev.to_dict() for ev in self.milestones],
+            "decisions": [ev.to_dict() for ev in self.decisions],
+            "important": [ev.to_dict() for ev in self.important],
+        }
 
     def to_text(self) -> str:
         """Render the story as plain text suitable for LLM context."""
@@ -71,6 +93,17 @@ class ProjectStory:
                 lines.append(marker)
             lines.append("")
 
+        if self.important:
+            lines.append("important events (by importance):")
+            for level in ("milestone", "high"):
+                group = [ev for ev in self.important if ev.importance == level]
+                if group:
+                    joined = ", ".join(
+                        f"[{ev.short_id()}] {ev.task}" for ev in group
+                    )
+                    lines.append(f"  {level}: {joined}")
+            lines.append("")
+
         if self.spine_file:
             lines.append(f"spine file: {self.spine_file}")
             lines.append("")
@@ -89,6 +122,43 @@ class ProjectStory:
 # --- public API --------------------------------------------------------------
 
 
+def descendant_counts(graph: EvolutionGraph) -> dict[str, int]:
+    """Reachable-descendant counts for every event, in one O(V+E) pass.
+
+    Equivalent to ``len(graph.descendants(v))`` per node (set semantics,
+    diamonds deduped) but computed with integer bitsets propagated in
+    reverse topological order. Nodes on a (hand-crafted) cycle fall back
+    to a per-node BFS.
+    """
+    ids = list(graph.events)
+    indegree = {eid: len(graph.incoming.get(eid, ())) for eid in ids}
+    queue = deque(eid for eid in ids if indegree[eid] == 0)
+    topo: list[str] = []
+    while queue:
+        cur = queue.popleft()
+        topo.append(cur)
+        for edge in graph.outgoing.get(cur, ()):
+            indegree[edge.target] -= 1
+            if indegree[edge.target] == 0:
+                queue.append(edge.target)
+
+    bit = {eid: 1 << i for i, eid in enumerate(ids)}
+    for cur in reversed(topo):
+        mask = bit[cur]
+        for edge in graph.outgoing.get(cur, ()):
+            target = edge.target
+            if target in bit and target != cur:
+                mask |= bit[target]
+        bit[cur] = mask
+
+    # Each mask includes the node itself; ``descendants()`` excludes it.
+    counts = {eid: bit[eid].bit_count() - 1 for eid in topo}
+    for eid in ids:
+        if eid not in counts:  # cycle: fall back to exact BFS
+            counts[eid] = len(graph.descendants(eid))
+    return counts
+
+
 def milestones(
     events: Iterable[TimelineEvent],
     graph: EvolutionGraph | None = None,
@@ -100,20 +170,20 @@ def milestones(
     if not events:
         return []
 
-    # Pre-compute descendant counts if we have a graph; otherwise treat all as 0.
-    descendant_counts: dict[str, int] = {}
-    if graph is not None:
-        for ev in events:
-            descendant_counts[ev.id] = len(graph.descendants(ev.id))
+    counts = descendant_counts(graph) if graph is not None else {}
 
     def score(ev: TimelineEvent) -> tuple[int, int]:
         # Sort key: (-score, id) — highest score wins, ties go to oldest.
         s = 0
-        s += descendant_counts.get(ev.id, 0) * 2
+        s += counts.get(ev.id, 0) * 2
         if "milestone" in ev.tags:
             s += 5
         if "release" in ev.tags:
             s += 5
+        if ev.importance == "milestone":
+            s += 5
+        if ev.importance == "high":
+            s += 3
         if ev.reason:
             s += 2
         if ev.files:
@@ -140,11 +210,14 @@ def build_story(
 
     file_counter: Counter[str] = Counter()
     decisions: list[TimelineEvent] = []
+    important: list[TimelineEvent] = []
     for ev in events:
         for f in ev.files:
             file_counter[f] += 1
         if ev.reason:
             decisions.append(ev)
+        if ev.importance in ("high", "milestone"):
+            important.append(ev)
 
     spine = file_counter.most_common(1)[0][0] if file_counter else None
 
@@ -156,20 +229,8 @@ def build_story(
         milestones=milestones(events, graph, max_milestones=max_milestones),
         spine_file=spine,
         decisions=decisions,
+        important=important,
     )
 
 
 # --- helpers -----------------------------------------------------------------
-
-
-def _short_date(iso: str) -> str:
-    """Return ``YYYY-MM-DD`` for an ISO timestamp."""
-    if not iso:
-        return ""
-    s = iso.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(s).strftime("%Y-%m-%d")
-    except ValueError:
-        return s[:10]

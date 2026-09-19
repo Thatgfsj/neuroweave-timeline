@@ -1,10 +1,9 @@
 """Write events and relations to a workspace.
 
 Writers go through :mod:`nwt.storage.atomic` so the timeline is never
-half-written, even if the process is killed mid-write. Writers also
-maintain secondary indices under ``.nwt/indices/`` for fast search; the
-indices are derived data and can be deleted at any time without losing
-information.
+half-written, even if the process is killed mid-write. Secondary indices
+are maintained by :mod:`nwt.storage.indices`; they are derived data and
+can be deleted at any time without losing information.
 """
 
 from __future__ import annotations
@@ -14,52 +13,82 @@ from pathlib import Path
 
 from nwt.core.errors import EventNotFoundError, ValidationError
 from nwt.core.event import TimelineEvent
-from nwt.core.ids import format_id
+from nwt.core.ids import canonical
 from nwt.core.relations import Relation
 from nwt.storage.atomic import write_text_atomic
+from nwt.storage.indices import IndexStore
 from nwt.storage.layout import Workspace
 
 
 # --- events ------------------------------------------------------------------
 
 
-def write_event(ws: Workspace, event: TimelineEvent) -> TimelineEvent:
+def write_event(
+    ws: Workspace, event: TimelineEvent, *, check_parent: bool = True
+) -> TimelineEvent:
     """Persist ``event`` to disk, updating indices.
 
     If ``event.id`` is empty, allocate the next id from the workspace
     counter. Returns the event with its id (and final timestamp) filled
     in. Raises :class:`EventNotFoundError` if a referenced parent does
-    not exist.
+    not exist. Pass ``check_parent=False`` in bulk-rewrite paths (like
+    compact) that may legitimately write a child before its parent.
     """
-    from nwt.core.ids import ID_WIDTH, parse_id
-
     if not event.id:
-        from nwt.core.ids import next_id
-
-        event.id = next_id(ws.counter_file)
+        event.id = next_free_id(ws)
     else:
-        # Validate id format.
+        # Validate id format (accepts padded or unpadded input).
         try:
-            format_id(int(event.id))
-        except (TypeError, ValueError) as e:
+            event.id = canonical(event.id)
+        except ValueError as e:
             raise ValidationError(f"bad event id {event.id!r}: {e}") from e
 
     if event.parent is not None:
         # Accept short or non-padded parent ids; pad to canonical form so
         # the file lookup succeeds.
         try:
-            n = parse_id(event.parent)
+            canonical_parent = canonical(event.parent)
         except ValueError as e:
             raise ValidationError(f"bad parent id {event.parent!r}: {e}") from e
-        canonical_parent = str(n).zfill(ID_WIDTH)
-        if not ws.event_file(canonical_parent).is_file():
-            raise EventNotFoundError(event.parent)
+        if check_parent:
+            if not ws.event_file(canonical_parent).is_file():
+                raise EventNotFoundError(event.parent)
+            if canonical_parent == event.id:
+                from nwt.core.errors import RelationError
+
+                raise RelationError("an event cannot be its own parent")
         event.parent = canonical_parent
 
     write_text_atomic(ws.event_file(event.id), event.to_json() + "\n")
-    _update_file_index(ws, event)
-    _update_tag_index(ws, event)
+    IndexStore(ws).update(event)
     return event
+
+
+def next_free_id(ws: Workspace) -> str:
+    """Allocate an id from the counter, skipping ids already on disk.
+
+    This heals a counter that fell behind the timeline (manual restore,
+    an interrupted compact): the atomic rename makes the counter itself
+    crash-safe, but a stale *value* would otherwise hand out a duplicate
+    id and silently overwrite an existing event.
+    """
+    from nwt.core.ids import next_id
+
+    event_id = next_id(ws.counter_file)
+    while ws.event_file(event_id).is_file():
+        event_id = next_id(ws.counter_file)
+    return event_id
+
+
+def reset_counter(ws: Workspace, next_value: int) -> None:
+    """Point the counter at ``next_value`` (used after compact renumbering).
+
+    Admin-level operation: callers are expected to have exclusive access
+    to the workspace while renumbering (see ``engine.compact_events``).
+    """
+    if next_value < 1:
+        raise ValidationError(f"counter must be >= 1, got {next_value}")
+    write_text_atomic(ws.counter_file, json.dumps({"next": next_value}))
 
 
 # --- relations ---------------------------------------------------------------
@@ -96,81 +125,12 @@ def write_relation(ws: Workspace, source: str, target: str, relation: Relation) 
 
 
 # --- secondary indices -------------------------------------------------------
-#
-# These are tiny JSON files used by the search/CLI for fast lookup. They are
-# rebuildable from the canonical event files, so a corrupt index is never
-# a data-loss event.
-
-_INDICES_DIR = "indices"
-
-
-def _indices_dir(ws: Workspace) -> Path:
-    p = ws.nwt_dir / _INDICES_DIR
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _update_file_index(ws: Workspace, event: TimelineEvent) -> None:
-    """Record ``path -> [event_ids...]`` for every file the event touches."""
-    p = _indices_dir(ws) / "files.json"
-    data: dict[str, list[str]] = {}
-    if p.is_file():
-        data = json.loads(p.read_text(encoding="utf-8"))
-    # Remove this event from every list first, so renames are reflected.
-    for path_key, ids in list(data.items()):
-        if event.id in ids:
-            ids.remove(event.id)
-            if not ids:
-                del data[path_key]
-    for path_key in event.files:
-        data.setdefault(path_key, []).append(event.id)
-    write_text_atomic(p, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-
-
-def _update_tag_index(ws: Workspace, event: TimelineEvent) -> None:
-    p = _indices_dir(ws) / "tags.json"
-    data: dict[str, list[str]] = {}
-    if p.is_file():
-        data = json.loads(p.read_text(encoding="utf-8"))
-    for tag, ids in list(data.items()):
-        if event.id in ids:
-            ids.remove(event.id)
-            if not ids:
-                del data[tag]
-    for tag in event.tags:
-        data.setdefault(tag, []).append(event.id)
-    write_text_atomic(p, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def rebuild_indices(ws: Workspace) -> None:
     """Recompute the secondary indices from the canonical event files.
 
-    Useful after manual edits or after upgrading NWT. Idempotent.
+    Kept as a module-level convenience; the implementation lives in
+    :class:`nwt.storage.indices.IndexStore`.
     """
-    # Wipe the indices directory and rebuild.
-    idx = ws.nwt_dir / _INDICES_DIR
-    if idx.exists():
-        for child in idx.glob("*.json"):
-            child.unlink()
-    idx.mkdir(parents=True, exist_ok=True)
-
-    events = []
-    for path in sorted(ws.timeline_dir.glob("*.json")):
-        if path.name.startswith("."):
-            continue
-        events.append(TimelineEvent.from_json(path.read_text(encoding="utf-8")))
-
-    files: dict[str, list[str]] = {}
-    tags: dict[str, list[str]] = {}
-    for ev in events:
-        for f in ev.files:
-            files.setdefault(f, []).append(ev.id)
-        for t in ev.tags:
-            tags.setdefault(t, []).append(ev.id)
-
-    write_text_atomic(
-        idx / "files.json", json.dumps(files, indent=2, ensure_ascii=False) + "\n"
-    )
-    write_text_atomic(
-        idx / "tags.json", json.dumps(tags, indent=2, ensure_ascii=False) + "\n"
-    )
+    IndexStore(ws).rebuild()

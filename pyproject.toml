@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "NWtimeline"
-version = "0.1.0"
+version = "0.2.0"
 description = "Process memory for AI agents and humans. Records how a project became what it is."
 readme = "README.md"
 requires-python = ">=3.10"

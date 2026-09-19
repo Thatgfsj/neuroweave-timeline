@@ -47,10 +47,11 @@ canonical timeline).
 
 ```
 nwt/
-├── core/        # pure data: TimelineEvent, Relation, id generation
-├── storage/     # .nwt/ filesystem layout, atomic writes, indices
+├── core/        # pure data: TimelineEvent, Relation, id generation, time helpers
+├── storage/     # .nwt/ filesystem layout, atomic writes, indices, counter
 ├── timeline/    # public engine: create_event, get_event, list_events, search
 ├── graph/       # Evolution Graph over events + relations; lineage helpers
+├── githook.py   # git integration (install-git-hook / log-commit)
 └── cli/, mcp/   # the two user surfaces
 ```
 
@@ -93,13 +94,19 @@ store.
 
 ## Concurrency model
 
-The MVP assumes one writer at a time (a human, a single agent, or a
-serialized CI job). Atomic file writes make the storage crash-safe:
-readers either see the old file or the new one, never a half-written
-one. Cross-process safety is provided by the OS's atomic rename.
+The MVP assumes one writer at a time for bulk operations (a human, a
+single agent, or a serialized CI job). Atomic file writes make the
+storage crash-safe: readers either see the old file or the new one,
+never a half-written one.
 
-The `next_id` allocator uses a thread lock plus an atomic counter
-file, so two writers in the same process can't collide, and two
-processes writing the counter will see one of them "win" the rename —
-the loser will reload and try again on the next call. This is good
-enough for the MVP; stronger guarantees wait for v0.2.
+The one hot spot — concurrent event creation — is guarded explicitly:
+the `next_id` allocator holds a cross-process lock (flock on POSIX,
+LockFile on Windows) for its whole read-increment-write cycle, so two
+`nwt log` processes cannot allocate the same id. As a second line of
+defense, the writer skips an allocated id whose event file already
+exists, which heals a counter that fell behind a restored or
+hand-edited timeline.
+
+Index maintenance and the destructive `compact` rewrite are still
+single-writer operations by design; full multi-agent collaboration
+(concurrent compacts, per-author identity) waits for v0.4.

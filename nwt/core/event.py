@@ -11,16 +11,20 @@ when files are inspected directly on disk.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Iterable
 
 from nwt.core.errors import ValidationError
-from nwt.core.ids import format_id, parse_id
+from nwt.core.ids import parse_id
+from nwt.core.time import parse_iso, utc_now_iso
 
 # Required fields on every event. ``parent`` is optional (null for the first
 # event in a chain). Everything else has a sensible default.
 _REQUIRED_FIELDS = ("id", "timestamp", "task", "summary")
+
+#: The set of importance levels accepted on an event.
+IMPORTANCE_LEVELS = ("low", "normal", "high", "milestone")
 
 
 @dataclass
@@ -35,10 +39,14 @@ class TimelineEvent:
         summary: One or two sentences describing what was done.
         reason: Why it was done. Optional but strongly encouraged — this is
             the field that turns NWT from a log into a *history*.
-        files: Project-relative file paths this event touched.
+        files: Project-relative file paths this event touched. Normalized
+            to POSIX separators (``src/foo.py``) on save, so Windows and
+            Unix clients query the same keys.
         tags: Free-form labels (e.g. ``"memory"``, ``"refactor"``,
             ``"milestone"``). Tags are lowercased on normalize.
         parent: Id of the preceding event in the linear chain, or None.
+        importance: One of ``low`` / ``normal`` / ``high`` / ``milestone``.
+            Anything else silently degrades to ``normal``.
         meta: Escape hatch for forward-compatible fields. The engine never
             inspects this; CLI/MCP output exposes it verbatim.
     """
@@ -51,7 +59,7 @@ class TimelineEvent:
     files: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     parent: str | None = None
-    importance: str = "normal"  # "low" | "normal" | "high" | "milestone"
+    importance: str = "normal"
     meta: dict[str, Any] = field(default_factory=dict)
 
     # ----- construction helpers ------------------------------------------------
@@ -77,16 +85,24 @@ class TimelineEvent:
         calls this internally). For tests, use :meth:`from_dict` so the id
         stays deterministic.
         """
+        if timestamp is not None:
+            # Validate on write, not just on read: a bad timestamp must
+            # be rejected here, or it poisons every later read of the
+            # timeline.
+            try:
+                parse_iso(timestamp)
+            except ValueError as e:
+                raise ValidationError(f"invalid timestamp {timestamp!r}: {e}") from e
         return cls(
             id=event_id or "",
-            timestamp=timestamp or _utc_now_iso(),
+            timestamp=timestamp or utc_now_iso(),
             task=task,
             summary=summary,
             reason=reason,
-            files=list(files or []),
+            files=_normalize_files(files or []),
             tags=_normalize_tags(tags or []),
             parent=parent,
-            importance=importance if importance in ("low", "normal", "high", "milestone") else "normal",
+            importance=importance if importance in IMPORTANCE_LEVELS else "normal",
             meta=dict(meta or {}),
         )
 
@@ -148,7 +164,7 @@ class TimelineEvent:
             raise ValidationError(str(e)) from e
 
         try:
-            _parse_iso(data["timestamp"])
+            parse_iso(data["timestamp"])
         except ValueError as e:
             raise ValidationError(f"invalid timestamp {data['timestamp']!r}: {e}") from e
 
@@ -174,7 +190,7 @@ class TimelineEvent:
                 raise ValidationError(f"invalid parent id {parent!r}: {e}") from e
 
         importance = data.get("importance", "normal")
-        if importance not in ("low", "normal", "high", "milestone"):
+        if importance not in IMPORTANCE_LEVELS:
             importance = "normal"
 
         meta = data.get("meta", {})
@@ -187,7 +203,7 @@ class TimelineEvent:
             task=data["task"],
             summary=data["summary"],
             reason=reason,
-            files=list(files),
+            files=_normalize_files(files),
             tags=_normalize_tags(tags),
             parent=parent,
             importance=importance,
@@ -213,17 +229,36 @@ class TimelineEvent:
 # ----- helpers ----------------------------------------------------------------
 
 
-def _utc_now_iso() -> str:
-    """Current UTC time as ISO 8601 with trailing Z."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def normalize_file(f: str) -> str:
+    """Normalize one file path to project-relative POSIX form.
+
+    ``src\\foo.py``, ``./src/foo.py`` and ``src/../src/foo.py`` all
+    become ``src/foo.py``, so the file index has one key per file
+    regardless of platform or how the path was typed. Leading ``..``
+    segments that cannot be collapsed are kept verbatim.
+    """
+    if not isinstance(f, str):
+        raise ValidationError(f"file must be a string, got {type(f).__name__}")
+    p = PurePosixPath(f.replace("\\", "/"))
+    parts: list[str] = []
+    for part in p.parts:
+        if part == ".":
+            continue
+        if part == ".." and parts and parts[-1] != "..":
+            parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts)
 
 
-def _parse_iso(value: str) -> datetime:
-    """Parse an ISO 8601 timestamp, accepting a trailing ``Z``."""
-    s = value.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
+def _normalize_files(files: Iterable[str]) -> list[str]:
+    """Dedupe and normalize file paths (see :func:`normalize_file`)."""
+    out: list[str] = []
+    for f in files:
+        s = normalize_file(f)
+        if s and s != "." and s not in out:
+            out.append(s)
+    return out
 
 
 def _normalize_tags(tags: Iterable[str]) -> list[str]:

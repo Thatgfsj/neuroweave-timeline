@@ -8,8 +8,11 @@ tests with a temporary directory.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+
+from nwt.core.time import utc_now_iso
 
 #: Name of the directory holding all NWT state for a project.
 WORKSPACE_DIR = ".nwt"
@@ -21,8 +24,12 @@ TIMELINE_DIR = "timeline"
 RELATIONS_DIR = "relations"
 
 #: Subdirectory reserved for v0.2 snapshots. Created on init for forward
-#: compatibility, but not written to in v0.1.
+#: compatibility; used by `nwt compact` for pre-rewrite backups.
 SNAPSHOTS_DIR = "snapshots"
+
+#: Subdirectory holding derived search indices. Owned by
+#: :mod:`nwt.storage.indices`; safe to delete at any time.
+INDICES_DIR = "indices"
 
 
 @dataclass(frozen=True)
@@ -53,12 +60,27 @@ class Workspace:
         return self.nwt_dir / SNAPSHOTS_DIR
 
     @property
+    def indices_dir(self) -> Path:
+        return self.nwt_dir / INDICES_DIR
+
+    @property
     def metadata_file(self) -> Path:
         return self.nwt_dir / "metadata.json"
 
     @property
     def counter_file(self) -> Path:
         return self.nwt_dir / ".counter.json"
+
+    def read_project_name(self) -> str | None:
+        """Read the project name from metadata.json (None if unreadable)."""
+        import json
+
+        try:
+            meta = json.loads(self.metadata_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        name = meta.get("project_name")
+        return name if isinstance(name, str) else None
 
     def event_file(self, event_id: str) -> Path:
         """Return the canonical path for an event file."""
@@ -112,15 +134,11 @@ def init_workspace(root: Path, *, project_name: str | None = None) -> Workspace:
     ws.relations_dir.mkdir(parents=True, exist_ok=True)
     ws.snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-    # metadata.json
-    import json
-    from datetime import datetime, timezone
-
     payload = {
         "schema_version": 1,
         "project_name": project_name or root.name,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "format": "nwt/0.1",
+        "created_at": utc_now_iso(),
+        "format": "nwt/0.2",
     }
     ws.metadata_file.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -128,7 +146,6 @@ def init_workspace(root: Path, *, project_name: str | None = None) -> Workspace:
     )
 
     # counter file starts at 1
-    from nwt.core.ids import next_id  # noqa: F401  (ensures module imported)
     ws.counter_file.write_text(json.dumps({"next": 1}), encoding="utf-8")
 
     return ws

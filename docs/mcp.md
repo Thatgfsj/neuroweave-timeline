@@ -45,9 +45,14 @@ after the fact.
   "reason": "Sequential retrieval was too slow",
   "files": ["activation.py"],
   "tags": ["memory", "optimization"],
-  "parent": "000007"
+  "importance": "high"
 }
 ```
+
+`parent` controls chain placement: omit it (or pass `"auto"`) to append
+after the latest event, pass `"none"` to start a new branch, or pass an
+event id to continue after that specific event. `importance` accepts
+`low`, `normal` (default), `high`, or `milestone`.
 
 ### `search_history`
 
@@ -69,6 +74,7 @@ Returns a structured project story with:
 * the spine file (most-touched file)
 * up to `max_milestones` milestone events
 * all decision events (those with a `reason`)
+* events flagged `high` or `milestone` importance
 * a `text` field pre-rendered for LLM context
 
 This is the tool an agent should call when it wants the "big picture".
