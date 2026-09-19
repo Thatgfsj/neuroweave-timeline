@@ -265,13 +265,13 @@ cwd. See [`docs/mcp.md`](docs/mcp.md) for the recommended agent loop:
 ## 安装
 
 ```bash
+# from PyPI
+pip install NWtimeline
+
 # from a clone (editable)
 git clone https://github.com/Thatgfsj/neuroweave-timeline
 cd neuroweave-timeline
 pip install -e .
-
-# from PyPI (coming soon)
-pip install NWtimeline
 ```
 
 需要 Python 3.10+。CLI 依赖于 `click`；MCP 服务器依赖于 `mcp`。两者都是自动安装的。
